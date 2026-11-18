@@ -13,8 +13,8 @@ OBJ = $(patsubst %.c,$(OBJDIR)/%.o,$(SRC))
 
 TARGET = bin/clevo-indicator
 
-CFLAGS += `pkg-config --cflags appindicator3-0.1`
-LDFLAGS += `pkg-config --libs appindicator3-0.1`
+CFLAGS += `pkg-config --cflags gio-2.0 dbusmenu-glib-0.4 cairo`
+LDFLAGS += `pkg-config --libs gio-2.0 dbusmenu-glib-0.4 cairo`
 
 all: $(TARGET)
 

@@ -47,9 +47,13 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <libappindicator/app-indicator.h>
+#include <gio/gio.h>
+#include <libdbusmenu-glib/dbusmenu-glib.h>
+#include <cairo/cairo.h>
 
 #define NAME "clevo-indicator"
+#define ITEM_PATH "/org/ayatana/NotificationItem/clevo_indicator"
+#define MENU_PATH "/org/ayatana/NotificationItem/clevo_indicator/Menu"
 
 #define EC_SC 0x66
 #define EC_DATA 0x62
@@ -71,7 +75,7 @@
 #define EC_REG_FAN_RPMS_HI 0xD0
 #define EC_REG_FAN_RPMS_LO 0xD1
 
-#define MAX_FAN_RPM 4400.0
+#define MAX_FAN_RPM 5500.0
 
 typedef enum {
     NA = 0, AUTO = 1, MANUAL = 2
@@ -85,6 +89,21 @@ static void main_on_sigterm(int signum);
 static int main_dump_fan(void);
 static int main_test_fan(int duty_percentage);
 static gboolean ui_update(gpointer user_data);
+static void ui_render_icon(void);
+static void ui_emit_signal(const char* member);
+static gboolean ui_register_item(gpointer user_data);
+static void ui_build_menu(void);
+static void sni_on_item_activated(DbusmenuMenuitem* item, guint timestamp,
+        gpointer user_data);
+static void sni_on_method_call(GDBusConnection* connection,
+        const gchar* sender, const gchar* object_path,
+        const gchar* interface_name, const gchar* method_name,
+        GVariant* parameters, GDBusMethodInvocation* invocation,
+        gpointer user_data);
+static GVariant* sni_get_property(GDBusConnection* connection,
+        const gchar* sender, const gchar* object_path,
+        const gchar* interface_name, const gchar* property_name,
+        GError** error, gpointer user_data);
 static void ui_command_set_fan(long fan_duty);
 static void ui_command_quit(gchar* command);
 static void ui_toggle_menuitems(int fan_duty);
@@ -107,14 +126,77 @@ static int check_proc_instances(const char* proc_name);
 static void get_time_string(char* buffer, size_t max, const char* format);
 static void signal_term(__sighandler_t handler);
 
-static AppIndicator* indicator = NULL;
+/* Status Notifier Item D-Bus interface (implements the standard directly,
+ * so the tray looks and behaves the same on LXQt, GNOME and KDE). */
+#define SNI_XML \
+"<node>" \
+" <interface name='org.kde.StatusNotifierItem'>" \
+"  <property name='Id' type='s' access='read'/>" \
+"  <property name='Category' type='s' access='read'/>" \
+"  <property name='Title' type='s' access='read'/>" \
+"  <property name='Status' type='s' access='read'/>" \
+"  <property name='WindowId' type='i' access='read'/>" \
+"  <property name='IconName' type='s' access='read'/>" \
+"  <property name='IconPixmap' type='a(iiay)' access='read'/>" \
+"  <property name='OverlayIconName' type='s' access='read'/>" \
+"  <property name='OverlayIconPixmap' type='a(iiay)' access='read'/>" \
+"  <property name='AttentionIconName' type='s' access='read'/>" \
+"  <property name='AttentionIconPixmap' type='a(iiay)' access='read'/>" \
+"  <property name='AttentionMovieName' type='s' access='read'/>" \
+"  <property name='ToolTip' type='(sa(iiay)ss)' access='read'/>" \
+"  <property name='ItemIsMenu' type='b' access='read'/>" \
+"  <property name='Menu' type='o' access='read'/>" \
+"  <method name='ContextMenu'>" \
+"   <arg name='x' type='i' direction='in'/>" \
+"   <arg name='y' type='i' direction='in'/>" \
+"  </method>" \
+"  <method name='Activate'>" \
+"   <arg name='x' type='i' direction='in'/>" \
+"   <arg name='y' type='i' direction='in'/>" \
+"  </method>" \
+"  <method name='SecondaryActivate'>" \
+"   <arg name='x' type='i' direction='in'/>" \
+"   <arg name='y' type='i' direction='in'/>" \
+"  </method>" \
+"  <method name='Scroll'>" \
+"   <arg name='delta' type='i' direction='in'/>" \
+"   <arg name='orientation' type='s' direction='in'/>" \
+"  </method>" \
+"  <signal name='NewIcon'/>" \
+"  <signal name='NewAttentionIcon'/>" \
+"  <signal name='NewOverlayIcon'/>" \
+"  <signal name='NewIconThemePath'>" \
+"   <arg name='icon_theme_path' type='s'/>" \
+"  </signal>" \
+"  <signal name='NewToolTip'/>" \
+"  <signal name='NewStatus'>" \
+"   <arg name='status' type='s'/>" \
+"  </signal>" \
+"  <signal name='NewTitle'/>" \
+" </interface>" \
+"</node>"
+
+static const GDBusInterfaceVTable sni_vtable = {
+    sni_on_method_call, sni_get_property, NULL, { 0 }
+};
+
+static GDBusConnection* bus = NULL;
+static GDBusNodeInfo* sni_node = NULL;
+static guint sni_reg_id = 0;
+static GMainLoop* ui_loop = NULL;
+static DbusmenuServer* menu_server = NULL;
+static guint8* pixmap_buf[2] = { NULL, NULL };
+static int pixmap_buf_idx = 0;
+static double blade_rotation = 0.0;
+static char tool_tip_title[256] = "Clevo";
+static char tool_tip_desc[256] = "";
 
 struct {
     char label[256];
     GCallback callback;
     long option;
     MenuItemType type;
-    GtkWidget* widget;
+    DbusmenuMenuitem* widget;
 
 }static menuitems[] = {
         { "Set FAN to AUTO", G_CALLBACK(ui_command_set_fan), 0, AUTO, NULL },
@@ -143,23 +225,12 @@ struct {
 }static *share_info = NULL;
 
 static pid_t parent_pid = 0;
+static pid_t ec_worker_pid = 0;
 
 int main(int argc, char* argv[]) {
     printf("Simple fan control utility for Clevo laptops\n");
     if (check_proc_instances(NAME) > 1) {
         printf("Multiple running instances!\n");
-        char* display = getenv("DISPLAY");
-        if (display != NULL && strlen(display) > 0) {
-            int desktop_uid = getuid();
-            setuid(desktop_uid);
-            //
-            gtk_init(&argc, &argv);
-            GtkWidget* dialog = gtk_message_dialog_new(NULL, 0,
-                    GTK_MESSAGE_ERROR, GTK_BUTTONS_CLOSE,
-                    "Multiple running instances of %s!", NAME);
-            gtk_dialog_run(GTK_DIALOG(dialog));
-            gtk_widget_destroy(dialog);
-        }
         return EXIT_FAILURE;
     }
     if (ec_init() != EXIT_SUCCESS) {
@@ -181,6 +252,7 @@ int main(int argc, char* argv[]) {
                 signal_term(&ec_on_sigterm);
                 return main_ec_worker();
             } else if (worker_pid > 0) {
+                ec_worker_pid = worker_pid;
                 main_ui_worker(argc, argv);
                 share_info->exit = 1;
                 waitpid(worker_pid, NULL, 0);
@@ -315,45 +387,50 @@ static int main_ec_worker(void) {
 }
 
 static void main_ui_worker(int argc, char** argv) {
+    (void) argc;
+    (void) argv;
     printf("Indicator...\n");
     int desktop_uid = getuid();
     setuid(desktop_uid);
     //
-    gtk_init(&argc, &argv);
-    //
-    GtkWidget* indicator_menu = gtk_menu_new();
-    for (int i = 0; i < menuitem_count; i++) {
-        GtkWidget* item;
-        if (strlen(menuitems[i].label) == 0) {
-            item = gtk_separator_menu_item_new();
-        } else {
-            item = gtk_menu_item_new_with_label(menuitems[i].label);
-            g_signal_connect_swapped(item, "activate",
-                    G_CALLBACK(menuitems[i].callback),
-                    (void* ) menuitems[i].option);
-        }
-        gtk_menu_shell_append(GTK_MENU_SHELL(indicator_menu), item);
-        menuitems[i].widget = item;
+    bus = g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, NULL);
+    if (bus == NULL) {
+        printf("unable to connect to the session bus\n");
+        return;
     }
-    gtk_widget_show_all(indicator_menu);
+    sni_node = g_dbus_node_info_new_for_xml(SNI_XML, NULL);
+    sni_reg_id = g_dbus_connection_register_object(bus, ITEM_PATH,
+            sni_node->interfaces[0], &sni_vtable, NULL, NULL, NULL);
+    if (sni_reg_id == 0) {
+        printf("unable to export the StatusNotifierItem object\n");
+        return;
+    }
+    // an icon and a menu must exist before hosts start reading the item
+    ui_render_icon();
+    ui_build_menu();
     //
-    indicator = app_indicator_new(NAME, "brasero",
-            APP_INDICATOR_CATEGORY_HARDWARE);
-    g_assert(IS_APP_INDICATOR(indicator));
-    app_indicator_set_label(indicator, "Init..", "XX");
-    app_indicator_set_status(indicator, APP_INDICATOR_STATUS_ATTENTION);
-    app_indicator_set_ordering_index(indicator, -2);
-    app_indicator_set_title(indicator, "Clevo");
-    app_indicator_set_menu(indicator, GTK_MENU(indicator_menu));
+    ui_loop = g_main_loop_new(NULL, FALSE);
     g_timeout_add(500, &ui_update, NULL);
-    ui_toggle_menuitems(share_info->fan_duty);
-    gtk_main();
+    // registers with the StatusNotifierWatcher, retrying until it succeeds
+    g_timeout_add(2000, &ui_register_item, NULL);
+    ui_register_item(NULL);
+    g_main_loop_run(ui_loop);
     printf("main on UI quit\n");
 }
 
 static void main_on_sigchld(int signum) {
-    printf("main on worker quit signal\n");
-    exit(EXIT_SUCCESS);
+    // Reap children but only quit when the EC worker itself is gone.
+    // Other children (e.g. helpers spawned by GTK or the input-method
+    // module) must not terminate the indicator.
+    int status = 0;
+    pid_t p;
+    while ((p = waitpid(-1, &status, WNOHANG)) > 0) {
+        if (ec_worker_pid != 0 && p == ec_worker_pid) {
+            printf("main: EC worker exited (status=%d)\n", status);
+            fflush(stdout);
+            exit(EXIT_SUCCESS);
+        }
+    }
 }
 
 static void main_on_sigterm(int signum) {
@@ -381,15 +458,222 @@ static int main_test_fan(int duty_percentage) {
 }
 
 static gboolean ui_update(gpointer user_data) {
-    char label[256];
-    sprintf(label, "%d℃ %d℃", share_info->cpu_temp, share_info->gpu_temp);
-    app_indicator_set_label(indicator, label, "XXXXXX");
-    char icon_name[256];
-    double load = ((double) share_info->fan_rpms) / MAX_FAN_RPM * 100.0;
-    double load_r = round(load / 5.0) * 5.0;
-    sprintf(icon_name, "brasero-disc-%02d", (int) load_r);
-    app_indicator_set_icon(indicator, icon_name);
+    (void) user_data;
+    // gentle spin of the blades while the fan runs
+    if (share_info->fan_rpms > 0)
+        blade_rotation += 15.0;
+    ui_render_icon();
+    // tooltip: title shown by most hosts, description below it (GTK markup)
+    snprintf(tool_tip_title, sizeof(tool_tip_title),
+            "Clevo - CPU %d°C · GPU %d°C · %d RPM (%d%%)",
+            share_info->cpu_temp, share_info->gpu_temp,
+            share_info->fan_rpms, share_info->fan_duty);
+    snprintf(tool_tip_desc, sizeof(tool_tip_desc),
+            "Clevo Fan Control — ventilador a %d RPM (duty %d%%)",
+            share_info->fan_rpms, share_info->fan_duty);
+    static char prev_tt[256] = "";
+    if (strcmp(prev_tt, tool_tip_title) != 0) {
+        snprintf(prev_tt, sizeof(prev_tt), "%s", tool_tip_title);
+        ui_emit_signal("NewToolTip");
+    }
+    ui_emit_signal("NewIcon");
     return G_SOURCE_CONTINUE;
+}
+
+static void ui_render_icon(void) {
+    const int S = 24;
+    const double C = S / 2.0;
+    cairo_surface_t* surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32,
+            S, S);
+    cairo_t* cr = cairo_create(surf);
+    // shroud ring (fully opaque colors: the pixmap travels as plain ARGB32,
+    // so semi-transparent colors would look darker on some hosts)
+    cairo_set_source_rgba(cr, 0.15, 0.15, 0.15, 1.0);
+    cairo_set_line_width(cr, 1.4);
+    cairo_arc(cr, C, C, 10.4, 0.0, 2.0 * M_PI);
+    cairo_stroke(cr);
+    // rotating blades
+    cairo_translate(cr, C, C);
+    cairo_rotate(cr, blade_rotation * M_PI / 180.0);
+    for (int i = 0; i < 3; i++) {
+        cairo_save(cr);
+        cairo_rotate(cr, i * 2.0 * M_PI / 3.0);
+        cairo_move_to(cr, 0.0, 0.0);
+        cairo_curve_to(cr, 4.8, -2.6, 4.8, -6.6, 0.0, -8.6);
+        cairo_curve_to(cr, -2.6, -7.2, -3.6, -3.6, 0.0, 0.0);
+        cairo_close_path(cr);
+        cairo_set_source_rgba(cr, 0.93, 0.93, 0.93, 1.0);
+        cairo_fill_preserve(cr);
+        cairo_set_source_rgba(cr, 0.15, 0.15, 0.15, 1.0);
+        cairo_set_line_width(cr, 1.4);
+        cairo_stroke(cr);
+        cairo_restore(cr);
+    }
+    // hub
+    cairo_arc(cr, 0.0, 0.0, 2.2, 0.0, 2.0 * M_PI);
+    cairo_set_source_rgba(cr, 0.93, 0.93, 0.93, 1.0);
+    cairo_fill_preserve(cr);
+    cairo_set_source_rgba(cr, 0.15, 0.15, 0.15, 1.0);
+    cairo_stroke(cr);
+    cairo_destroy(cr);
+    // copy the cairo buffer into a big-endian ARGB32 pixmap buffer (the SNI
+    // IconPixmap format is network byte order); ping-pong buffers keep the
+    // previous frame valid while hosts read the current one
+    int new_idx = pixmap_buf_idx ^ 1;
+    guint8* dst = pixmap_buf[new_idx];
+    if (dst == NULL)
+        dst = pixmap_buf[new_idx] = g_malloc((gsize) S * S * 4);
+    const guint8* src = cairo_image_surface_get_data(surf);
+    int stride = cairo_image_surface_get_stride(surf);
+    for (int y = 0; y < S; y++) {
+        const guint32* row = (const guint32*) (src + (gsize) y * stride);
+        guint32* out = (guint32*) (dst + (gsize) y * S * 4);
+        for (int x = 0; x < S; x++)
+            out[x] = GUINT32_TO_BE(row[x]);
+    }
+    cairo_surface_destroy(surf);
+    pixmap_buf_idx = new_idx;
+}
+
+static void ui_emit_signal(const char* member) {
+    if (bus == NULL)
+        return;
+    GError* err = NULL;
+    g_dbus_connection_emit_signal(bus, NULL, ITEM_PATH,
+            "org.kde.StatusNotifierItem", member, NULL, &err);
+    if (err != NULL)
+        g_error_free(err);
+}
+
+static gboolean ui_register_item(gpointer user_data) {
+    static int registered = 0;
+    (void) user_data;
+    if (bus == NULL || registered)
+        return G_SOURCE_REMOVE;
+    GError* err = NULL;
+    GVariant* res = g_dbus_connection_call_sync(bus,
+            "org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher",
+            "org.kde.StatusNotifierWatcher", "RegisterStatusNotifierItem",
+            g_variant_new("(s)", ITEM_PATH), NULL, G_DBUS_CALL_FLAGS_NONE,
+            1000, NULL, &err);
+    if (res != NULL) {
+        g_variant_unref(res);
+        registered = 1;
+        printf("StatusNotifierItem registered\n");
+        fflush(stdout);
+        return G_SOURCE_REMOVE;
+    }
+    printf("unable to register with StatusNotifierWatcher (%s), retrying\n",
+            err != NULL ? err->message : "?");
+    fflush(stdout);
+    if (err != NULL)
+        g_error_free(err);
+    return G_SOURCE_CONTINUE;
+}
+
+static void ui_build_menu(void) {
+    menu_server = dbusmenu_server_new(MENU_PATH);
+    DbusmenuMenuitem* root = dbusmenu_menuitem_new();
+    for (int i = 0; i < menuitem_count; i++) {
+        DbusmenuMenuitem* item = dbusmenu_menuitem_new();
+        if (strlen(menuitems[i].label) == 0) {
+            dbusmenu_menuitem_property_set(item, "type", "separator");
+        } else {
+            dbusmenu_menuitem_property_set(item, "label", menuitems[i].label);
+            dbusmenu_menuitem_property_set_bool(item, "enabled", TRUE);
+            g_signal_connect(G_OBJECT(item), "item-activated",
+                    G_CALLBACK(sni_on_item_activated), GINT_TO_POINTER(i));
+        }
+        dbusmenu_menuitem_child_append(root, item);
+        menuitems[i].widget = item;
+    }
+    dbusmenu_server_set_root(menu_server, root);
+}
+
+static void sni_on_item_activated(DbusmenuMenuitem* item, guint timestamp,
+        gpointer user_data) {
+    (void) item;
+    (void) timestamp;
+    int i = GPOINTER_TO_INT(user_data);
+    if (i >= 0 && i < menuitem_count && menuitems[i].callback != NULL)
+        ((void (*)(long)) menuitems[i].callback)(menuitems[i].option);
+}
+
+static void sni_on_method_call(GDBusConnection* connection,
+        const gchar* sender, const gchar* object_path,
+        const gchar* interface_name, const gchar* method_name,
+        GVariant* parameters, GDBusMethodInvocation* invocation,
+        gpointer user_data) {
+    (void) connection;
+    (void) sender;
+    (void) object_path;
+    (void) interface_name;
+    (void) parameters;
+    (void) user_data;
+    // Activate (left click) is a no-op: hosts that prefer the menu show it
+    // themselves because ItemIsMenu is set. ContextMenu is also a no-op:
+    // the Menu property points to our dbusmenu object.
+    if (strcmp(method_name, "Activate") == 0
+            || strcmp(method_name, "SecondaryActivate") == 0
+            || strcmp(method_name, "ContextMenu") == 0
+            || strcmp(method_name, "Scroll") == 0) {
+        g_dbus_method_invocation_return_value(invocation, NULL);
+    }
+}
+
+/* Builds the IconPixmap array "(iiay)" from the current frame. cairo ARGB32
+ * data is premultiplied little-endian; the SNI format wants big-endian ARGB32
+ * (identical here because all colors are fully opaque). */
+static GVariant* ui_pixmap_variant(void) {
+    guint8* data = pixmap_buf[pixmap_buf_idx];
+    if (data == NULL)
+        return g_variant_new_array(G_VARIANT_TYPE("(iiay)"), NULL, 0);
+    GVariant* ay = g_variant_new_from_data(G_VARIANT_TYPE("ay"), data,
+            (gsize) 24 * 24 * 4, TRUE, NULL, NULL);
+    GVariant* entry = g_variant_new("(ii@ay)", 24, 24, ay);
+    return g_variant_new_array(G_VARIANT_TYPE("(iiay)"), &entry, 1);
+}
+
+static GVariant* sni_get_property(GDBusConnection* connection,
+        const gchar* sender, const gchar* object_path,
+        const gchar* interface_name, const gchar* property_name,
+        GError** error, gpointer user_data) {
+    (void) connection;
+    (void) sender;
+    (void) object_path;
+    (void) interface_name;
+    (void) user_data;
+    if (strcmp(property_name, "Id") == 0)
+        return g_variant_new_string(NAME);
+    if (strcmp(property_name, "Category") == 0)
+        return g_variant_new_string("Hardware");
+    if (strcmp(property_name, "Title") == 0)
+        return g_variant_new_string("Clevo");
+    if (strcmp(property_name, "Status") == 0)
+        return g_variant_new_string("Passive");
+    if (strcmp(property_name, "WindowId") == 0)
+        return g_variant_new_int32(0);
+    if (strcmp(property_name, "ItemIsMenu") == 0)
+        return g_variant_new_boolean(TRUE);
+    if (strcmp(property_name, "Menu") == 0)
+        return g_variant_new_object_path(MENU_PATH);
+    if (strcmp(property_name, "IconName") == 0
+            || strcmp(property_name, "OverlayIconName") == 0
+            || strcmp(property_name, "AttentionIconName") == 0
+            || strcmp(property_name, "AttentionMovieName") == 0
+            || strcmp(property_name, "IconThemePath") == 0)
+        return g_variant_new_string("");
+    if (strcmp(property_name, "IconPixmap") == 0)
+        return ui_pixmap_variant();
+    if (strcmp(property_name, "OverlayIconPixmap") == 0
+            || strcmp(property_name, "AttentionIconPixmap") == 0)
+        return g_variant_new_array(G_VARIANT_TYPE("(iiay)"), NULL, 0);
+    if (strcmp(property_name, "ToolTip") == 0)
+        return g_variant_new("(s@a(iiay)ss)", "", ui_pixmap_variant(),
+                tool_tip_title, tool_tip_desc);
+    g_set_error(error, G_DBUS_ERROR, G_DBUS_ERROR_INVALID_ARGS,
+            "No such property: %s", property_name);
+    return NULL;
 }
 
 static void ui_command_set_fan(long fan_duty) {
@@ -409,21 +693,24 @@ static void ui_command_set_fan(long fan_duty) {
 }
 
 static void ui_command_quit(gchar* command) {
+    (void) command;
     printf("clicked on quit\n");
-    gtk_main_quit();
+    if (ui_loop != NULL)
+        g_main_loop_quit(ui_loop);
 }
 
 static void ui_toggle_menuitems(int fan_duty) {
     for (int i = 0; i < menuitem_count; i++) {
         if (menuitems[i].widget == NULL)
             continue;
+        int enabled;
         if (fan_duty == 0)
-            gtk_widget_set_sensitive(menuitems[i].widget,
-                    menuitems[i].type != AUTO);
+            enabled = menuitems[i].type != AUTO;
         else
-            gtk_widget_set_sensitive(menuitems[i].widget,
-                    menuitems[i].type != MANUAL
-                            || (int) menuitems[i].option != fan_duty);
+            enabled = menuitems[i].type != MANUAL
+                    || (int) menuitems[i].option != fan_duty;
+        dbusmenu_menuitem_property_set_bool(menuitems[i].widget, "enabled",
+                enabled ? TRUE : FALSE);
     }
 }
 
